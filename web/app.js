@@ -45,11 +45,13 @@ new ResizeObserver(resize).observe(host);
 
 function clearHelpers() {
   scene.remove(helpers);
+  disposeTree(helpers);
   helpers = new THREE.Group();
   scene.add(helpers);
 }
 
 function frame(box) {
+  if (box.isEmpty()) return; // nothing visible - keep the current camera
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
   const r = Math.max(size.length() / 2, 1);
@@ -106,8 +108,19 @@ async function loadLines(url) {
   return new THREE.LineSegments(geom, edgeMaterial);
 }
 
+function disposeTree(root) {
+  root.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => m !== edgeMaterial && m.dispose());
+  });
+}
+
 async function showModel(url, label, { bed = null, lines = null } = {}) {
-  if (modelGroup) scene.remove(modelGroup);
+  if (modelGroup) {
+    scene.remove(modelGroup);
+    disposeTree(modelGroup); // free GPU memory from the previous model
+    modelGroup = null;
+  }
   clearHelpers();
   edgeLines = null;
   $("edgeToggle").hidden = true;
@@ -248,7 +261,8 @@ function renderAnalysis() {
 let scale = 1;
 const bed = () => printers[$("pPrinter").value].bed;
 const fitsAt = (s) => baseDims.every((v, i) => v * s <= bed()[i] + 1e-6);
-const fitScale = () => Math.min(...baseDims.map((v, i) => (bed()[i] - 2) / v)); // 1 mm margin each side
+// 1 mm margin each side; ignore flat (zero-size) axes so they can't divide by zero.
+const fitScale = () => Math.min(...baseDims.map((v, i) => (v > 1e-9 ? (bed()[i] - 2) / v : Infinity)));
 
 function setScale(s, except = null) {
   if (!baseDims || !isFinite(s) || s <= 0) return;
@@ -264,7 +278,7 @@ function setScale(s, except = null) {
 }
 ["dX", "dY", "dZ"].forEach((id, i) => $(id).addEventListener("input", (e) => {
   const v = parseFloat(e.target.value);
-  if (v > 0) setScale(v / baseDims[i], id);
+  if (v > 0 && baseDims[i] > 1e-9) setScale(v / baseDims[i], id);
 }));
 $("pScale").addEventListener("input", (e) => { const v = parseFloat(e.target.value); if (v > 0) setScale(v / 100, "pScale"); });
 $("pPrinter").addEventListener("change", () => setScale(scale));

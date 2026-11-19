@@ -76,6 +76,30 @@ def test_closed_solids_union_exactly():
         assert abs(max(prep["dims_mm"]) - 2 * 55) < 0.05
 
 
+def test_duplicates_need_matching_shape():
+    """Different objects that merely share a bounding box must not count as duplicates."""
+    with tempfile.TemporaryDirectory() as d:
+        m = r.File3dm()
+        m.Settings.ModelUnitSystem = r.UnitSystem.Millimeters
+        m.Objects.AddLine(r.Point3d(0, 0, 0), r.Point3d(10, 10, 0))
+        m.Objects.AddLine(r.Point3d(0, 10, 0), r.Point3d(10, 0, 0))   # same bbox, different line
+        m.Objects.AddLine(r.Point3d(0, 0, 0), r.Point3d(10, 10, 0))   # true copy of the first
+        p = os.path.join(d, "lines.3dm")
+        assert m.Write(p, 8)
+        assert analyze.analyze(p).duplicates == {2}
+
+
+def test_clean_keeps_rhino_version():
+    if not SAMPLE.exists():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        v7 = os.path.join(d, "v7.3dm")
+        assert r.File3dm.Read(str(SAMPLE)).Write(v7, 7)
+        out = os.path.join(d, "v7-fixed.3dm")
+        clean.clean(analyze.analyze(v7), clean.CleanOptions(), out)
+        assert r.File3dm.ReadArchiveVersion(out) == 70
+
+
 def test_sample_model():
     if not SAMPLE.exists():
         return
@@ -92,5 +116,9 @@ if __name__ == "__main__":
     print("messy model: ok")
     test_closed_solids_union_exactly()
     print("closed solids: ok")
+    test_duplicates_need_matching_shape()
+    print("duplicate detection: ok")
+    test_clean_keeps_rhino_version()
+    print("rhino version kept: ok")
     test_sample_model()
     print("sample model: ok")

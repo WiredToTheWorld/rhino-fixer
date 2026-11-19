@@ -125,7 +125,11 @@ def clean(a: Analysis, opts: CleanOptions, out_path: str) -> dict:
 
     if not actions:
         actions.append("No problems needed fixing - the model was rewritten unchanged.")
-    ok = model.Write(out_path, 8)
+    # Save in the same Rhino version as the upload so older Rhino can still open it
+    # (ArchiveVersion is 50/60/70/80 for Rhino 5-8).
+    av = int(model.ArchiveVersion or 80)
+    version = min(8, max(5, av // 10 if av >= 50 else av))
+    ok = model.Write(out_path, version) or (version != 8 and model.Write(out_path, 8))
     if not ok:
         raise RuntimeError("Failed to write the cleaned .3dm file.")
 

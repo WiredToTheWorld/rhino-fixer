@@ -15,16 +15,26 @@ import trimesh
 
 # Scale factor from a Rhino unit system to millimetres.
 _UNIT_TO_MM = {
+    "Angstroms": 1e-7,
+    "Nanometers": 1e-6,
     "Microns": 0.001,
     "Millimeters": 1.0,
     "Centimeters": 10.0,
+    "Decimeters": 100.0,
     "Meters": 1000.0,
+    "Dekameters": 10_000.0,
+    "Hectometers": 100_000.0,
     "Kilometers": 1_000_000.0,
+    "Microinches": 2.54e-5,
+    "Mils": 0.0254,
     "Inches": 25.4,
     "Feet": 304.8,
     "Yards": 914.4,
     "Miles": 1_609_344.0,
-    "None": 1.0,
+    "NauticalMiles": 1_852_000.0,
+    "PrinterPoints": 25.4 / 72,
+    "PrinterPicas": 25.4 / 6,
+    "None": 1.0,  # unitless: assume millimetres
 }
 
 
@@ -216,32 +226,45 @@ def _p(pt) -> tuple[float, float, float]:
     return (pt.X, pt.Y, pt.Z)
 
 
-def _curve_polyline(c, offset) -> np.ndarray:
+MAX_LINE_POINTS = 600_000  # cap on preview line samples per object (keeps huge files fast)
+DIJKSTRA_CHUNK_ENTRIES = 20_000_000  # max (starts x vertices) table per shortest-path batch
+
+
+def _curve_polyline(c, offset, max_n: int = 64) -> np.ndarray:
     dom = c.Domain
     try:
         linear = c.IsLinear()
     except Exception:
         linear = False
-    n = 2 if linear else int(min(64, max(8, c.SpanCount * max(c.Degree, 1) * 3)))
+    n = 2 if linear else int(min(max_n, max(4, c.SpanCount * max(c.Degree, 1) * 3)))
     ts = np.linspace(dom.T0, dom.T1, n)
     return np.array([_p(c.PointAt(float(t))) for t in ts]) - offset
 
 
 def _brep_lines(g: r.Brep, offset) -> list[np.ndarray]:
-    return [_curve_polyline(g.Edges[i], offset) for i in range(len(g.Edges))]
+    ne = len(g.Edges)
+    # Fewer samples per edge on Breps with very many edges.
+    max_n = int(min(64, max(4, MAX_LINE_POINTS // max(ne, 1))))
+    return [_curve_polyline(g.Edges[i], offset, max_n) for i in range(ne)]
 
 
-def _subd_lines(g: r.SubD, offset, levels: int) -> list[np.ndarray]:
+def _subd_lines(g: r.SubD, offset, levels: int, mesh=None) -> list[np.ndarray]:
     """SubD edges on the limit surface: shortest paths over a fine subdivision
-    mesh between each edge's exact limit end points."""
+    mesh between each edge's exact limit end points.
+
+    `mesh` may be the (vertices, faces) already built by _mesh_subd for this
+    SubD with the same offset, to avoid subdividing twice.
+    """
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import dijkstra
     from scipy.spatial import cKDTree
 
-    parts = _mesh_subd(g, offset, levels)
-    if not parts:
-        return []
-    v, f = parts[0]
+    if mesh is None:
+        parts = _mesh_subd(g, offset, levels)
+        if not parts:
+            return []
+        mesh = parts[0]
+    v, f = np.asarray(mesh[0]), np.asarray(mesh[1])
     e = np.vstack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
     w = np.linalg.norm(v[e[:, 0]] - v[e[:, 1]], axis=1)
     graph = coo_matrix((np.r_[w, w], (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])),
@@ -264,25 +287,40 @@ def _subd_lines(g: r.SubD, offset, levels: int) -> list[np.ndarray]:
     ends = np.array([[a, b] for a, b in edges])
     _, ia = tree.query(ends[:, 0])
     _, ib = tree.query(ends[:, 1])
+
+    # Dijkstra returns a dense (starts x vertices) predecessor table, so run it
+    # in chunks of start vertices to keep memory bounded (~20M entries a chunk).
+    # `limit` stops each search once it is well past the longest edge.
+    edge_len = np.linalg.norm(ends[:, 0] - ends[:, 1], axis=1)
+    limit = float(edge_len.max() * 3 + w.max() * 4) if len(w) else np.inf
     starts = np.unique(ia)
-    dist, pred = dijkstra(graph, indices=starts, return_predecessors=True)
-    row = {s: k for k, s in enumerate(starts)}
-    lines = []
-    for (a, b), s, t in zip(edges, ia, ib):
-        path, cur, k = [t], t, row[s]
-        while cur != s and cur >= 0 and len(path) < 10_000:
-            cur = pred[k, cur]
-            path.append(cur)
-        if cur != s:
-            lines.append(np.array([a, b]))  # disconnected - fall back to a straight segment
-            continue
-        pts = v[path[::-1]]
-        pts[0], pts[-1] = a, b
-        lines.append(pts)
-    return lines
+    chunk = max(1, DIJKSTRA_CHUNK_ENTRIES // max(len(v), 1))
+    by_start: dict[int, list[int]] = {}
+    for k, s in enumerate(ia):
+        by_start.setdefault(int(s), []).append(k)
+    lines: list[np.ndarray | None] = [None] * len(edges)
+    for c0 in range(0, len(starts), chunk):
+        block = starts[c0:c0 + chunk]
+        _, pred = dijkstra(graph, indices=block, return_predecessors=True, limit=limit)
+        for row, s in enumerate(block):
+            for k in by_start[int(s)]:
+                a, b = edges[k]
+                t = int(ib[k])
+                path, cur = [t], t
+                while cur != s and cur >= 0 and len(path) < 10_000:
+                    cur = int(pred[row, cur])
+                    path.append(cur)
+                if cur != s:
+                    lines[k] = np.array([a, b])  # unreachable - straight segment
+                    continue
+                pts = v[path[::-1]].copy()
+                pts[0], pts[-1] = a, b
+                lines[k] = pts
+        del pred
+    return [pl for pl in lines if pl is not None]
 
 
-def object_lines(model, g, offset, subd_levels=3, depth=0) -> list[np.ndarray]:
+def object_lines(model, g, offset, subd_levels=3, depth=0, mesh=None) -> list[np.ndarray]:
     t = geom_type(g)
     if t == "Brep":
         return _brep_lines(g, offset)
@@ -290,7 +328,7 @@ def object_lines(model, g, offset, subd_levels=3, depth=0) -> list[np.ndarray]:
         b = g.ToBrep(False)
         return _brep_lines(b, offset) if b is not None else []
     if t == "SubD":
-        return _subd_lines(g, offset, subd_levels)
+        return _subd_lines(g, offset, subd_levels, mesh)
     if t == "InstanceReference" and depth < 8:
         idef = model.InstanceDefinitions.FindId(g.ParentIdefId)
         if idef is None:

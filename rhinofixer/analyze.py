@@ -79,6 +79,27 @@ def _find_outliers(infos: list[mio.ObjInfo], unit_mm: float) -> set[int]:
     return out
 
 
+def _grid(values, tol) -> tuple:
+    return tuple(np.round(np.asarray(values, dtype=float) / (tol * 10)).astype(np.int64))
+
+
+def _fingerprint(info: mio.ObjInfo, geom, mesh: trimesh.Trimesh | None, offset, tol):
+    """A cheap shape signature; None means 'cannot tell, never treat as a duplicate'."""
+    try:
+        if mesh is not None:
+            # Vertex count, total area and vertex centroid pin down a mesh closely.
+            return (len(mesh.vertices), f"{mesh.area:.6g}", _grid(mesh.vertices.mean(axis=0), tol))
+        if info.type == "Curve":
+            dom = geom.Domain
+            pts = [geom.PointAtStart, geom.PointAt((dom.T0 + dom.T1) / 2), geom.PointAtEnd]
+            return _grid([c for p in pts for c in (p.X, p.Y, p.Z)] - np.tile(offset, 3), tol)
+        if info.type == "Point":
+            return ("point",)  # a point's bounding box is its location
+    except Exception:
+        pass
+    return None
+
+
 def analyze(path: str, subd_levels: int = 3) -> Analysis:
     model = r.File3dm.Read(path)
     if model is None:
@@ -93,17 +114,6 @@ def analyze(path: str, subd_levels: int = 3) -> Analysis:
                   (i.type != "Point" and np.linalg.norm(i.bbox[1] - i.bbox[0]) < tol)}
     degenerate -= invalid
     outliers = _find_outliers(infos, unit_mm) - invalid - degenerate
-
-    # Duplicate objects: same type, same face count, same bounding box (to tolerance).
-    seen, duplicates = {}, set()
-    for i in infos:
-        if i.bbox is None:
-            continue
-        key = (i.type, i.face_count, tuple(np.round(np.r_[i.bbox[0], i.bbox[1]] / (tol * 10)).astype(np.int64)))
-        if key in seen:
-            duplicates.add(i.index)
-        else:
-            seen[key] = i.index
 
     main = {i.index for i in infos} - outliers - invalid - degenerate
     bb = mio.overall_bbox(infos, main) or mio.overall_bbox(infos)
@@ -124,7 +134,10 @@ def analyze(path: str, subd_levels: int = 3) -> Analysis:
         if tm is not None and len(tm.faces):
             meshes[i.index] = tm
             try:
-                lines[i.index] = mio.object_lines(model, model.Objects[i.index].Geometry, offset, subd_levels)
+                # A SubD's mesh is a single part built with the same offset - reuse it.
+                pre = (tm.vertices, tm.faces) if i.type == "SubD" else None
+                lines[i.index] = mio.object_lines(model, model.Objects[i.index].Geometry, offset,
+                                                  subd_levels, mesh=pre)
             except Exception:
                 pass  # lines are cosmetic only
         for n in obj_notes:
@@ -133,6 +146,21 @@ def analyze(path: str, subd_levels: int = 3) -> Analysis:
 
     bad_meshes = {i for i in invalid if i in meshes}
     invalid -= bad_meshes
+
+    # Duplicate objects: same type, bounding box AND shape fingerprint, so that
+    # different objects which merely share a bounding box are never deleted.
+    seen, duplicates = {}, set()
+    for i in infos:
+        if i.bbox is None or i.index in invalid:
+            continue
+        fp = _fingerprint(i, model.Objects[i.index].Geometry, meshes.get(i.index), offset, tol)
+        if fp is None:
+            continue
+        key = (i.type, i.face_count, _grid(np.r_[i.bbox[0], i.bbox[1]], tol), fp)
+        if key in seen:
+            duplicates.add(i.index)
+        else:
+            seen[key] = i.index
 
     by_index = infos_by_index(infos)
     dense = set()
@@ -153,7 +181,8 @@ def analyze(path: str, subd_levels: int = 3) -> Analysis:
     if bb is not None:
         far = float(np.max(np.abs(np.r_[bb[0], bb[1]]))) * unit_mm
         size = float(np.max(bb[1] - bb[0])) * unit_mm
-        if far > 1_000_000 or (far > 10 * max(size, 1) and far > 100_000):
+        # Judge distance relative to model size, so large site models aren't flagged.
+        if far > 10 * max(size, 1) and far > 100_000:
             issues.append(Issue("error", "far_from_origin", "Model is a long way from the origin",
                                 f"Geometry sits {mio.fmt_len(far)} from 0,0,0 but is only {mio.fmt_len(size)} across. "
                                 "Huge coordinates exhaust floating-point precision, which causes jittery display, "
