@@ -1,0 +1,9 @@
+.venv/
+jobs/
+__pycache__/
+*.pyc
+.git/
+.github/
+.claude/
+sample files/
+tests/

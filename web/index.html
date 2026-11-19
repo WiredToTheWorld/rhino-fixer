@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rhino Fixer</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◆</span> Rhino Fixer</div>
+    <div class="tagline">Repair Rhino models &amp; make them 3D-printable</div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer-wrap">
+      <div id="viewer"></div>
+      <div class="viewer-empty" id="viewerEmpty">
+        <div class="drop" id="dropZone">
+          <div class="drop-icon">⬆</div>
+          <div class="drop-title">Drop a Rhino <code>.3dm</code> file here</div>
+          <div class="drop-sub">or <label class="link">browse<input type="file" id="fileInput" accept=".3dm" hidden></label></div>
+        </div>
+      </div>
+      <div class="viewer-label" id="viewerLabel" hidden></div>
+      <label class="viewer-toggle" id="edgeToggle" hidden><input type="checkbox" id="showEdges" checked> Edges</label>
+      <div class="busy" id="busy" hidden><div class="spinner"></div><div id="busyText">Working…</div></div>
+    </section>
+
+    <aside class="panel">
+      <div id="intro" class="card">
+        <h2>How it works</h2>
+        <ol class="howto">
+          <li>Upload a <b>.3dm</b> file. It is analysed for common problems.</li>
+          <li><b>Clean up</b>: move it to the origin, remove stray / invalid / duplicate objects and slim overly dense meshes. Download a fixed <b>.3dm</b>.</li>
+          <li><b>3D print</b>: choose a printer and final size and get a watertight <b>.3mf</b> / <b>.stl</b> ready for Bambu Studio.</li>
+        </ol>
+        <p class="muted" id="privacyNote">Files are processed locally on this computer.</p>
+      </div>
+
+      <div id="fileCard" class="card" hidden>
+        <div class="file-head">
+          <div>
+            <div class="file-name" id="fileName"></div>
+            <div class="muted small" id="fileMeta"></div>
+          </div>
+          <label class="btn ghost small">Replace<input type="file" id="fileInput2" accept=".3dm" hidden></label>
+        </div>
+        <div class="stats" id="stats"></div>
+        <h3>Problems found</h3>
+        <ul class="issues" id="issues"></ul>
+      </div>
+
+      <div id="modes" hidden>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="clean" role="tab">1 · Clean up model</button>
+          <button class="tab" data-tab="print" role="tab">2 · 3D print</button>
+        </div>
+
+        <!-- CLEAN -->
+        <div class="card tabpane" id="tab-clean">
+          <p class="muted small">Keeps your NURBS / SubD geometry intact and writes a repaired Rhino file.</p>
+          <label class="field">Reposition model
+            <select id="cOrigin">
+              <option value="base_center" selected>Centre on origin, sit on ground (Z=0)</option>
+              <option value="center">Centre on origin</option>
+              <option value="min_corner">Corner at origin</option>
+              <option value="none">Don't move</option>
+            </select>
+          </label>
+          <div class="checks">
+            <label><input type="checkbox" id="cOutliers" checked> Delete stray objects far from the model</label>
+            <label><input type="checkbox" id="cInvalid" checked> Delete invalid geometry</label>
+            <label><input type="checkbox" id="cDegenerate" checked> Delete zero-size objects</label>
+            <label><input type="checkbox" id="cDuplicates" checked> Delete exact duplicates</label>
+            <label><input type="checkbox" id="cRepair" checked> Repair meshes (weld, remove bad faces, fix normals)</label>
+            <label><input type="checkbox" id="cDecimate" checked> Reduce over-dense meshes to at most
+              <input type="number" id="cMaxFaces" value="200000" min="5000" step="10000" class="inline-num"> triangles</label>
+            <label><input type="checkbox" id="cCurves"> Delete curves &amp; points</label>
+          </div>
+          <button class="btn primary wide" id="cleanBtn">Clean model</button>
+          <div id="cleanResult" class="result" hidden></div>
+        </div>
+
+        <!-- PRINT -->
+        <div class="card tabpane" id="tab-print" hidden>
+          <label class="field">Printer
+            <select id="pPrinter"></select>
+          </label>
+
+          <div class="size-head">
+            <h3>Print size</h3>
+            <span class="muted small" id="origSize"></span>
+          </div>
+          <div class="dims">
+            <label>Width X<input type="number" id="dX" step="0.1" min="0.1"><span>mm</span></label>
+            <label>Depth Y<input type="number" id="dY" step="0.1" min="0.1"><span>mm</span></label>
+            <label>Height Z<input type="number" id="dZ" step="0.1" min="0.1"><span>mm</span></label>
+          </div>
+          <div class="scale-row">
+            <label>Scale<input type="number" id="pScale" step="0.1" min="0.01"><span>%</span></label>
+            <button class="btn ghost small" id="fitBtn">Fit to bed</button>
+            <button class="btn ghost small" id="realBtn">100%</button>
+          </div>
+          <div class="fit" id="fitMsg"></div>
+          <p class="muted small">Proportions are always kept. Change any one dimension and the others follow.</p>
+
+          <details class="advanced">
+            <summary>Repair settings</summary>
+            <label class="field">Detail
+              <div class="seg" id="pRes">
+                <button data-v="draft">Draft</button><button data-v="standard" class="on">Standard</button><button data-v="fine">Fine</button>
+              </div>
+            </label>
+            <label class="field">Minimum wall thickness for open surfaces
+              <span class="num-unit"><input type="number" id="pWall" value="0.8" step="0.1" min="0"><span>mm</span></span>
+            </label>
+            <label class="field">Seal gaps &amp; holes narrower than
+              <span class="num-unit"><input type="number" id="pGaps" value="1.0" step="0.1" min="0"><span>mm</span></span>
+            </label>
+            <label class="field">Discard loose fragments smaller than
+              <span class="num-unit"><input type="number" id="pCrumbs" value="1" step="0.5" min="0"><span>mm³</span></span>
+            </label>
+            <div class="checks">
+              <label><input type="checkbox" id="pSmooth" checked> Smooth voxel steps</label>
+              <label><input type="checkbox" id="pForce"> Always rebuild as solid (skip exact repair)</label>
+            </div>
+          </details>
+
+          <button class="btn primary wide" id="printBtn">Make watertight for printing</button>
+          <div id="printResult" class="result" hidden></div>
+        </div>
+      </div>
+
+      <div id="error" class="card error" hidden></div>
+    </aside>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

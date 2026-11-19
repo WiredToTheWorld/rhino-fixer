@@ -1,0 +1,6 @@
+# Keep LF line endings so the Linux container and workflow scripts work.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.3dm binary
+*.3mf binary
+*.stl binary
